@@ -307,13 +307,15 @@ class OnlineMLPredictor:
         self.label_buf     = collections.deque(maxlen=CALIBRATION_WINDOW)
 
         # Raw SGD model (online updates)
+        # FIX: class_weight must be a dict (not 'balanced') for partial_fit compatibility.
+        # We start with equal weights and recompute dynamically in partial_update().
         if SKLEARN_AVAILABLE:
             self.sgd = SGDClassifier(
-                loss="log_loss",          # logistic — gives predict_proba
+                loss="log_loss",
                 alpha=0.0001,
                 max_iter=1,
                 warm_start=True,
-                class_weight="balanced",
+                class_weight={0: 1.0, 1: 1.0},  # FIX: plain dict instead of 'balanced'
                 random_state=42,
             )
             self.scaler         = StandardScaler()
@@ -332,6 +334,19 @@ class OnlineMLPredictor:
             self.scaler.partial_fit(X)
             self.scaler_fitted = True
         return self.scaler.transform(X)
+
+    def _compute_class_weights(self) -> dict:
+        """
+        Compute balanced class weights from the rolling label buffer.
+        Mirrors sklearn's 'balanced' formula: w_c = n_samples / (n_classes * n_c)
+        """
+        labels = np.array(self.label_buf)
+        n_total = len(labels)
+        n0 = int(np.sum(labels == 0))
+        n1 = int(np.sum(labels == 1))
+        w0 = n_total / (2 * n0) if n0 > 0 else 1.0
+        w1 = n_total / (2 * n1) if n1 > 0 else 1.0
+        return {0: w0, 1: w1}
 
     def partial_update(self, feature_vec: np.ndarray, label: int):
         """
@@ -352,6 +367,8 @@ class OnlineMLPredictor:
 
         # partial_fit needs both classes to have been seen at least once
         if len(set(self.label_buf)) == 2:
+            # FIX: dynamically compute and apply balanced class weights
+            self.sgd.class_weight = self._compute_class_weights()
             self.sgd.partial_fit(X_scaled, [label], classes=[0, 1])
 
         if self.candles_seen >= ML_WARMUP_CANDLES:
@@ -366,7 +383,7 @@ class OnlineMLPredictor:
         self.scaler.fit(X)
         X_scaled = self.scaler.transform(X)
 
-        # Fresh SGD retrain
+        # Fresh SGD retrain — full .fit() supports 'balanced' string directly
         self.sgd = SGDClassifier(
             loss="log_loss", alpha=0.0001, max_iter=200,
             class_weight="balanced", random_state=42,
@@ -385,6 +402,16 @@ class OnlineMLPredictor:
         except Exception as e:
             print(f"  ⚠️  Calibration failed: {e}")
             self.calibrated_clf = None
+
+        # After full_retrain, reset online SGD to dict-based weights so
+        # subsequent partial_fit() calls keep working correctly
+        self.sgd = SGDClassifier(
+            loss="log_loss", alpha=0.0001, max_iter=1,
+            warm_start=True,
+            class_weight={0: 1.0, 1: 1.0},  # FIX: dict for partial_fit compatibility
+            random_state=42,
+        )
+        self.sgd.fit(X_scaled, y)   # seed warm_start with current data
 
         self.scaler_fitted = True
         print(f"  🔄 Full retrain complete. Samples: {len(y)}")
