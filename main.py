@@ -873,7 +873,101 @@ def build_broadcast(predictor, ml_pred, candle, prediction, confidence, signals,
         f"👥 {subscriber_count()} subscribers  •  /start /stop /status"
     )
 
+def backtest_365_days():
+    print("\n🔁 Starting 365-day backtest with confidence buckets...\n")
 
+    predictor = CandlePredictor()
+    ml_pred = OnlineMLPredictor()
+    drift_det = ADWIN(delta=ADWIN_DELTA)
+
+    historical = fetch_historical(SYMBOL, INTERVAL, DAYS)
+
+    # ---- Overall stats ----
+    total = 0
+    correct = 0
+
+    # ---- Confidence bucket stats ----
+    thresholds = list(range(15, 75, 5))  # 15,20,...70
+    bucket_total = {t: 0 for t in thresholds}
+    bucket_correct = {t: 0 for t in thresholds}
+
+    last_feature_vec = None
+    last_prediction = None
+    last_confidence = 0
+
+    for i, candle in enumerate(historical):
+
+        # ── STEP 1: Predict using previous state ──
+        if last_feature_vec is not None:
+            pred, conf, _ = ml_pred.predict(last_feature_vec)
+            last_prediction = pred
+            last_confidence = conf
+        else:
+            last_prediction = None
+            last_confidence = 0
+
+        # ── STEP 2: Observe actual candle ──
+        direction = predictor.add_candle(candle)
+        label = 1 if direction == "green" else 0
+
+        # ── STEP 3: Evaluate prediction ──
+        if last_prediction is not None:
+            total += 1
+
+            is_correct = (
+                (last_prediction == "green" and direction == "green") or
+                (last_prediction == "red" and direction == "red")
+            )
+
+            if is_correct:
+                correct += 1
+
+            # ---- Confidence bucket tracking ----
+            for t in thresholds:
+                if last_confidence > t:
+                    bucket_total[t] += 1
+                    if is_correct:
+                        bucket_correct[t] += 1
+
+            # ---- Drift detection ----
+            if drift_det.add_element(not is_correct):
+                print(f"🌊 Drift detected at candle {i}")
+                ml_pred.full_retrain()
+
+        # ── STEP 4: Train AFTER seeing result ──
+        feat_now = predictor.get_feature_vector()
+
+        if last_feature_vec is not None:
+            ml_pred.partial_update(last_feature_vec, label)
+
+        last_feature_vec = feat_now
+
+        # Progress logging
+        if (i + 1) % 10000 == 0:
+            print(f"Processed {i+1}/{len(historical)} candles...")
+
+    # ── FINAL RESULTS ──
+    overall_acc = 100 * correct / total if total else 0
+
+    print("\n📊 BACKTEST RESULTS (365 Days)")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Total Predictions : {total}")
+    print(f"Overall Accuracy  : {overall_acc:.2f}%")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    print("\n🔥 CONFIDENCE BUCKET PERFORMANCE")
+    print("Threshold | Trades | Accuracy")
+    print("--------------------------------")
+
+    for t in thresholds:
+        t_total = bucket_total[t]
+        t_correct = bucket_correct[t]
+        acc = (100 * t_correct / t_total) if t_total else 0
+
+        print(f">{t:2d}%      | {t_total:6d} | {acc:6.2f}%")
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+  
 # ── CONSOLE DASHBOARD ─────────────────────────────────────────────────────────
 def print_dashboard(predictor, ml_pred, candle, prediction, confidence,
                     signals, actual_dir, ml_source, drift_count):
@@ -1098,6 +1192,5 @@ def main():
 
         time.sleep(1)
 
-
 if __name__ == "__main__":
-    main()
+    backtest_365_days()
