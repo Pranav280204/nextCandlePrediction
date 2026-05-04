@@ -998,7 +998,101 @@ def print_dashboard(predictor, ml_pred, candle, prediction, confidence,
         print(f"  ⚡ DRIFT DETECTED — model retrained!")
     print(sep)
 
+def backtest_profit():
+    print("\n💰 Starting PROFIT-BASED backtest...\n")
 
+    predictor = CandlePredictor()
+    ml_pred = OnlineMLPredictor()
+    drift_det = ADWIN(delta=ADWIN_DELTA)
+
+    historical = fetch_historical(SYMBOL, INTERVAL, DAYS)
+
+    # ---- Trading config ----
+    CONF_THRESHOLD = 55      # only trade strong signals
+    MIN_MOVE = 0.0005        # skip small moves (~0.05%)
+    FEE = 0.0006             # 0.06% per trade
+    POSITION_SIZE = 1.0      # 1x
+
+    balance = 1000.0
+    equity_curve = [balance]
+
+    wins = 0
+    losses = 0
+    trades = 0
+
+    last_feature_vec = None
+    last_price = None
+    last_prediction = None
+    last_conf = 0
+
+    for i, candle in enumerate(historical):
+        close_price = float(candle[4])
+
+        # ── Predict ──
+        if last_feature_vec is not None:
+            pred, conf, _ = ml_pred.predict(last_feature_vec)
+            last_prediction = pred
+            last_conf = conf
+
+        # ── Execute trade ──
+        if last_prediction and last_price is not None:
+            ret = (close_price - last_price) / last_price
+
+            # Skip noise candles
+            if abs(ret) > MIN_MOVE and last_conf > CONF_THRESHOLD:
+                trades += 1
+
+                if last_prediction == "green":
+                    pnl = ret
+                else:
+                    pnl = -ret
+
+                pnl -= FEE
+
+                balance *= (1 + pnl * POSITION_SIZE)
+
+                if pnl > 0:
+                    wins += 1
+                else:
+                    losses += 1
+
+        # ── Update model ──
+        direction = predictor.add_candle(candle)
+        label = 1 if direction == "green" else 0
+
+        if last_feature_vec is not None:
+            ml_pred.partial_update(last_feature_vec, label)
+
+        last_feature_vec = predictor.get_feature_vector()
+        last_price = close_price
+
+        equity_curve.append(balance)
+
+        if (i + 1) % 10000 == 0:
+            print(f"Processed {i+1}/{len(historical)} candles...")
+
+    # ── Results ──
+    winrate = 100 * wins / trades if trades else 0
+    roi = 100 * (balance - 1000) / 1000
+
+    # Max drawdown
+    peak = equity_curve[0]
+    max_dd = 0
+    for x in equity_curve:
+        if x > peak:
+            peak = x
+        dd = (peak - x) / peak
+        if dd > max_dd:
+            max_dd = dd
+
+    print("\n💰 PROFIT BACKTEST RESULTS")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Trades        : {trades}")
+    print(f"Win Rate      : {winrate:.2f}%")
+    print(f"Final Balance : ${balance:.2f}")
+    print(f"ROI           : {roi:.2f}%")
+    print(f"Max Drawdown  : {max_dd*100:.2f}%")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 62)
@@ -1193,4 +1287,4 @@ def main():
         time.sleep(1)
 
 if __name__ == "__main__":
-    backtest_365_days()
+    backtest_profit()
