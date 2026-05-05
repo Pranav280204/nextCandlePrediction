@@ -151,6 +151,10 @@ def now_str():
     return datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
 
 def classify(candle):
+    # Internal tuple format: (ts, direction, o, h, l, c, v)
+    if len(candle) >= 7 and str(candle[1]) in ("green", "red", "doji"):
+        return str(candle[1])
+
     o, c = float(candle[1]), float(candle[4])
     if c > o:   return "green"
     elif c < o: return "red"
@@ -571,11 +575,12 @@ def fetch_historical_streaming(predictor, symbol, interval, days):
             predictor.add_candle(candle)
             last_candle = candle
             total_ingested += 1
-        progress(total_ingested, fetched, f"{total_ingested:,}/{fetched:,} ingested")
+        progress(total_ingested, fetched, "Ingestion")
         all_batches[bi] = None  # free batch memory immediately [MEM-5]
 
     del all_batches
-    progress_done(f"Ingestion complete — window: {predictor.candle_count:,} candles")
+    predictor._suppress_retrain = False
+    progress_done("Ingestion")
     return last_candle
 
 
@@ -907,6 +912,8 @@ class CandlePredictor:
         self.ml_confidence = 0.0
         self.ml_last_features = None
         self._candles_since_retrain = 0
+        self._ml_training = False
+        self._suppress_retrain = False
 
         self.recent_outcomes    = collections.deque(maxlen=CONF_ADAPT_WINDOW)
         self.min_conf_adaptive  = BASE_MIN_CONF
@@ -914,7 +921,10 @@ class CandlePredictor:
     # ── Ingest ────────────────────────────────────────────────────────────────
     def add_candle(self, candle):
         direction = classify(candle)
-        o, h, l, c, v = (float(candle[i]) for i in range(1, 6))
+        if len(candle) >= 7 and str(candle[1]) in ("green", "red", "doji"):
+            o, h, l, c, v = (float(candle[i]) for i in range(2, 7))
+        else:
+            o, h, l, c, v = (float(candle[i]) for i in range(1, 6))
 
         if self.window:
             prev = self.window[-1][1]
@@ -934,9 +944,13 @@ class CandlePredictor:
         self.last_candle_time = int(candle[0])
         self._candles_since_retrain += 1
 
-        if ML_AVAILABLE and self._candles_since_retrain >= ML_RETRAIN_FREQ:
+        if (ML_AVAILABLE and not self._suppress_retrain and not self._ml_training
+                and self._candles_since_retrain >= ML_RETRAIN_FREQ):
+            self._ml_training = True
             threading.Thread(target=self.train_ml_model, daemon=True).start()
             self._candles_since_retrain = 0
+        self._ml_training = False
+        self._suppress_retrain = False
 
         return direction
 
@@ -963,10 +977,8 @@ class CandlePredictor:
         all_indices = list(range(min_start, len(rows) - 1))
         if len(all_indices) > ML_TRAIN_CAP:
             sampled = sorted(random.sample(all_indices, ML_TRAIN_CAP))
-            print(f"  🤖 ML: sampling {ML_TRAIN_CAP:,} of {len(all_indices):,} candles")
         else:
             sampled = all_indices
-            print(f"  🤖 ML: using all {len(sampled):,} candles")
 
         X, y = [], []
         for step, i in enumerate(sampled):
@@ -979,28 +991,32 @@ class CandlePredictor:
             X.append(feats); y.append(label)
 
             if (step + 1) % 500 == 0:
-                progress(step + 1, len(sampled),
-                         f"Extracting features {step+1}/{len(sampled)}")
+                progress(step + 1, len(sampled), "Extracting features")
 
-        progress_done(f"Feature extraction done — {len(X)} samples")
+        progress_done("Extracting features")
 
         if len(X) < 100:
             return f"Insufficient training samples: {len(X)}"
 
+        if self._ml_training and not force:
+            return "ML training already in progress"
+
+        self._ml_training = True
         try:
-            print("  🤖 Fitting RandomForest...")
+            progress(1, 3, "ML training")
             scaler = StandardScaler()
             Xs = scaler.fit_transform(X)
 
             rf = RandomForestClassifier(
                 n_estimators=100, max_depth=8, min_samples_leaf=5,
-                max_features="sqrt", random_state=42, n_jobs=-1,
+                max_features="sqrt", random_state=42, n_jobs=1,
                 class_weight="balanced"
             )
             rf.fit(Xs, y)
+            progress(2, 3, "ML training")
 
-            print("  🤖 Running 5-fold cross-validation...")
-            cv_scores = cross_val_score(rf, Xs, y, cv=5, scoring="accuracy")
+            cv_scores = cross_val_score(rf, Xs, y, cv=5, scoring="accuracy", n_jobs=1)
+            progress_done("ML training")
             cv_mean   = round(cv_scores.mean() * 100, 2)
 
             self.ml_model   = rf
@@ -1014,7 +1030,8 @@ class CandlePredictor:
             return msg
         except Exception as e:
             return f"ML training failed: {e}"
-
+        finally:
+            self._ml_training = False
     def _ml_predict(self, ohlcv, closes):
         if not self.ml_trained or self.ml_model is None: return None, 0.0
         # Use only the last LOOKBACK+5 candles for live prediction
@@ -1313,14 +1330,24 @@ class CandlePredictor:
         print(f"  🔬 Walk-forward backtest: {total:,} candles...")
 
         for i, candle in enumerate(candles):
-            if i == 0: bt.add_candle(candle); continue
+            # Support both raw exchange candles and internal stored tuples
+            # internal tuple format: (ts, direction, o, h, l, c, v)
+            if len(candle) >= 7 and str(candle[1]) in ("green", "red", "doji"):
+                ingest_candle = [candle[0], candle[2], candle[3], candle[4], candle[5], candle[6]]
+                actual = candle[1]
+            else:
+                ingest_candle = candle
+                actual = classify(candle)
+
+            if i == 0:
+                bt.add_candle(ingest_candle)
+                continue
 
             pred, conf, _, is_flat, regime = bt.predict_next()
-            actual = classify(candle)
-            bt.add_candle(candle)
+            bt.add_candle(ingest_candle)
 
             if (i + 1) % 500 == 0:
-                progress(i + 1, total, f"Backtest {i+1}/{total}")
+                progress(i + 1, total, "Backtest")
 
             if pred is None or actual == "doji": continue
             if is_flat or conf < bt.min_conf_adaptive:
@@ -1330,7 +1357,7 @@ class CandlePredictor:
             correct = pred == actual
             results.append((correct, conf, False, regime))
 
-        progress_done(f"Backtest done")
+        progress_done("Backtest")
 
         acted = [(c, conf, reg) for c, conf, sk, reg in results if not sk and c is not None]
         total_acted = len(acted); correct_count = sum(1 for c, _, _ in acted if c)
