@@ -34,7 +34,7 @@ try:
     import numpy as np
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import cross_val_score
+    from sklearn.model_selection import cross_val_score, TimeSeriesSplit
     ML_AVAILABLE = True
     print("✅ scikit-learn + numpy detected — ML ensemble ENABLED")
 except ImportError:
@@ -93,7 +93,7 @@ WILLIAMS_R_PERIOD = 14
 VWAP_SESSION_CANDLES = 78
 
 # ── Gates & risk ─────────────────────────────────────────────────────────────
-BASE_MIN_CONF   = 5.0
+BASE_MIN_CONF   = 12.0
 ATR_FLAT_PCT    = 0.04
 ATR_EXTREME_PCT = 0.25
 MAX_LOSS_STREAK = 7
@@ -315,7 +315,7 @@ def handle_start(chat_id, username):
         send_message(chat_id,
             "✅ <b>Already subscribed!</b>\n\n"
             "You receive elite BTC/USD 5m predictions with:\n"
-            "  🤖 ML RandomForest ensemble\n"
+            "  🤖 ML RF+GB ensemble\n"
             "  📊 15+ technical signals\n"
             "  🌐 5-timeframe MTF bias stack\n"
             "  🧠 Market regime detection\n\n"
@@ -920,10 +920,11 @@ class CandlePredictor:
         self.mtf_alignment = 0.0
         self.regime        = "trending"
 
-        self.ml_model   = None
+        self.ml_models  = {}
         self.ml_scaler  = None
         self.ml_trained = False
         self.ml_confidence = 0.0
+        self.ml_threshold = 0.5
         self.ml_last_features = None
         self._candles_since_retrain = 0
         self._ml_training = False
@@ -1022,24 +1023,47 @@ class CandlePredictor:
             Xs = scaler.fit_transform(X)
 
             rf = RandomForestClassifier(
-                n_estimators=100, max_depth=8, min_samples_leaf=5,
-                max_features="sqrt", random_state=42, n_jobs=1,
-                class_weight="balanced"
+                n_estimators=320, max_depth=14, min_samples_leaf=2,
+                min_samples_split=6, max_features="sqrt", random_state=42,
+                n_jobs=1, class_weight="balanced_subsample"
+            )
+            gb = GradientBoostingClassifier(
+                n_estimators=220, learning_rate=0.05,
+                max_depth=3, subsample=0.8, random_state=42
             )
             rf.fit(Xs, y)
+            gb.fit(Xs, y)
             progress(2, 3, "ML training")
 
-            cv_scores = cross_val_score(rf, Xs, y, cv=5, scoring="accuracy", n_jobs=1)
+            cv_rf = cross_val_score(rf, Xs, y, cv=5, scoring="accuracy", n_jobs=1)
+            cv_gb = cross_val_score(gb, Xs, y, cv=5, scoring="accuracy", n_jobs=1)
             progress_done("ML training")
-            cv_mean   = round(cv_scores.mean() * 100, 2)
+            cv_rf_mean = round(cv_rf.mean() * 100, 2)
+            cv_gb_mean = round(cv_gb.mean() * 100, 2)
 
-            self.ml_model   = rf
+            # time-aware threshold tuning on the most recent fold only
+            tscv = TimeSeriesSplit(n_splits=5)
+            tr_idx, va_idx = list(tscv.split(Xs))[-1]
+            rf_val = rf.predict_proba(Xs[va_idx])[:, 1]
+            gb_val = gb.predict_proba(Xs[va_idx])[:, 1]
+            p_val = (rf_val + gb_val) / 2.0
+            y_val = [y[i] for i in va_idx]
+            best_t, best_acc = 0.5, -1.0
+            for t in [x / 100 for x in range(35, 66)]:
+                preds = [1 if p >= t else 0 for p in p_val]
+                acc = sum(1 for yp, yt in zip(preds, y_val) if yp == yt) / len(y_val)
+                if acc > best_acc:
+                    best_t, best_acc = t, acc
+            self.ml_threshold = best_t
+
+            self.ml_models  = {"rf": rf, "gb": gb}
             self.ml_scaler  = scaler
             self.ml_trained = True
             self._candles_since_retrain = 0
 
-            msg = (f"ML RandomForest retrained! {len(X)} samples | "
-                   f"CV accuracy: {cv_mean}%")
+            msg = (f"ML ensemble retrained! {len(X)} samples | "
+                   f"CV RF: {cv_rf_mean}% | CV GB: {cv_gb_mean}% | "
+                   f"Thr: {self.ml_threshold:.2f}")
             print(f"  ✅ {msg}")
             return msg
         except Exception as e:
@@ -1047,16 +1071,20 @@ class CandlePredictor:
         finally:
             self._ml_training = False
     def _ml_predict(self, ohlcv, closes):
-        if not self.ml_trained or self.ml_model is None: return None, 0.0
+        if not self.ml_trained or not self.ml_models: return None, 0.0
         # Use only the last LOOKBACK+5 candles for live prediction
         sl = max(0, len(ohlcv) - LOOKBACK - 5)
         feats = extract_features(ohlcv[sl:], closes[sl:], list(self.window)[-LOOKBACK-5:])
         if feats is None: return None, 0.0
         try:
             Xs = self.ml_scaler.transform([feats])
-            proba = self.ml_model.predict_proba(Xs)[0]
-            pred = "green" if proba[1] >= 0.5 else "red"
-            conf = abs(proba[1] - 0.5) * 200
+            probs = []
+            for mdl in self.ml_models.values():
+                probs.append(mdl.predict_proba(Xs)[0][1])
+            p_up = sum(probs) / len(probs)
+            pred = "green" if p_up >= self.ml_threshold else "red"
+            edge = abs(p_up - self.ml_threshold) / max(self.ml_threshold, 1 - self.ml_threshold)
+            conf = min(edge * 100, 100.0)
             self.ml_confidence = round(conf, 1)
             return pred, conf
         except Exception:
@@ -1282,6 +1310,36 @@ class CandlePredictor:
             if alignment_ratio >= 0.75:
                 conf = min(conf * 1.15, 100.0)
 
+
+        # ── Quality gate: require stronger consensus when signals disagree ────
+        directional = [
+            "ML_RF", "EMA Ribbon", "MACD", "MACD Delta", "VWAP",
+            "Donchian", "MTF", "Momentum(50)", "Markov"
+        ]
+        bull_votes = bear_votes = 0
+        for name in directional:
+            if name not in signals:
+                continue
+            val = WEIGHTS.get(name, [1.0, 1.0, 1.0])[ridx]
+            # infer direction from score contribution rather than label text
+            # using the latest computed feature score encoded in green_score ratio
+            # fall back to ml_pred for ML signal
+            if name == "ML_RF" and ml_pred is not None:
+                if ml_pred == "green": bull_votes += val
+                else: bear_votes += val
+            elif name in ("EMA Ribbon", "VWAP", "MACD", "MACD Delta", "Donchian", "Momentum(50)", "Markov", "MTF"):
+                # derive direction by parsing the compact label emoji prefix
+                label = signals[name]
+                if "🟢" in label: bull_votes += val
+                elif "🔴" in label: bear_votes += val
+
+        vote_total = bull_votes + bear_votes
+        if vote_total >= 6.0:
+            majority = max(bull_votes, bear_votes) / vote_total if vote_total else 0.5
+            if majority < 0.60:
+                conf *= 0.65
+            elif majority >= 0.75:
+                conf = min(conf * 1.08, 100.0)
         # ── ATR gate ──────────────────────────────────────────────────────────
         atr = compute_atr(ohlcv)
         is_flat = False
@@ -1369,7 +1427,9 @@ class CandlePredictor:
                 progress(i + 1, total, "Backtest")
 
             if pred is None or actual == "doji": continue
-            if is_flat or conf < bt.min_conf_adaptive:
+            regime_floor = 16.0 if regime == "choppy" else (14.0 if regime == "ranging" else 12.0)
+            effective_floor = max(bt.min_conf_adaptive, regime_floor)
+            if is_flat or conf < effective_floor:
                 total_skipped += 1
                 results.append((None, conf, True, regime)); continue
 
@@ -1751,7 +1811,7 @@ def main():
     sep = "=" * 72
     print(sep)
     print("  BTC/USD 5m Predictor — ★ v3.1 MEMORY FIXED ★")
-    print("  ML: RandomForest | 15+ Signals | 5 Timeframes | Progress Logging")
+    print("  ML: RF+GB Ensemble | 15+ Signals | 5 Timeframes | Progress Logging")
     print(sep)
 
     # ── Phase 0: DB init ──────────────────────────────────────────────────────
@@ -1776,7 +1836,7 @@ def main():
 
     # ── Phase 4: ML training ──────────────────────────────────────────────────
     if ML_AVAILABLE:
-        print(f"\n🤖 Phase 4/5 — ML RandomForest training")
+        print(f"\n🤖 Phase 4/5 — ML RF+GB ensemble training")
         print(f"   Capped at {ML_TRAIN_CAP:,} samples (was O(n²) — now O(n)) [MEM-2,3]")
         result = predictor.train_ml_model(force=True)
         print(f"   ✅ {result}")
@@ -1859,7 +1919,7 @@ def main():
         f"🔮 First prediction: "
         f"{'🟢 GREEN' if prediction == 'green' else '🔴 RED'}"
         f" ({confidence:.1f}%)" + (" ⚠️ volatile" if is_flat else "") + "\n\n"
-        f"<i>15+ signals | 5 TFs | RandomForest ML | Walk-forward backtest\n"
+        f"<i>15+ signals | 5 TFs | RF+GB Ensemble ML | Walk-forward backtest\n"
         f"Commands: /backtest /retrain /status /predict /accuracy /regime /dashboard</i>"
     )
 
