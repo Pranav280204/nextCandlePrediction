@@ -575,11 +575,12 @@ def fetch_historical_streaming(predictor, symbol, interval, days):
             predictor.add_candle(candle)
             last_candle = candle
             total_ingested += 1
-        progress(total_ingested, fetched, f"{total_ingested:,}/{fetched:,} ingested")
+        progress(total_ingested, fetched, "Ingestion")
         all_batches[bi] = None  # free batch memory immediately [MEM-5]
 
     del all_batches
-    progress_done(f"Ingestion complete — window: {predictor.candle_count:,} candles")
+    predictor._suppress_retrain = False
+    progress_done("Ingestion")
     return last_candle
 
 
@@ -911,6 +912,8 @@ class CandlePredictor:
         self.ml_confidence = 0.0
         self.ml_last_features = None
         self._candles_since_retrain = 0
+        self._ml_training = False
+        self._suppress_retrain = False
 
         self.recent_outcomes    = collections.deque(maxlen=CONF_ADAPT_WINDOW)
         self.min_conf_adaptive  = BASE_MIN_CONF
@@ -941,9 +944,13 @@ class CandlePredictor:
         self.last_candle_time = int(candle[0])
         self._candles_since_retrain += 1
 
-        if ML_AVAILABLE and self._candles_since_retrain >= ML_RETRAIN_FREQ:
+        if (ML_AVAILABLE and not self._suppress_retrain and not self._ml_training
+                and self._candles_since_retrain >= ML_RETRAIN_FREQ):
+            self._ml_training = True
             threading.Thread(target=self.train_ml_model, daemon=True).start()
             self._candles_since_retrain = 0
+        self._ml_training = False
+        self._suppress_retrain = False
 
         return direction
 
@@ -991,6 +998,10 @@ class CandlePredictor:
         if len(X) < 100:
             return f"Insufficient training samples: {len(X)}"
 
+        if self._ml_training and not force:
+            return "ML training already in progress"
+
+        self._ml_training = True
         try:
             progress(1, 3, "ML training")
             scaler = StandardScaler()
@@ -1019,7 +1030,8 @@ class CandlePredictor:
             return msg
         except Exception as e:
             return f"ML training failed: {e}"
-
+        finally:
+            self._ml_training = False
     def _ml_predict(self, ohlcv, closes):
         if not self.ml_trained or self.ml_model is None: return None, 0.0
         # Use only the last LOOKBACK+5 candles for live prediction
