@@ -52,7 +52,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN",  "8766778348:AAEpkHO55y_oCrJ0vrTwtXsm8cWE_4IOZxA")
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN",  "8765096815:AAGiv8KQkqPMRDS2oQPOapZhj5GXeRNS3T8")
 ADMIN_CHAT_ID   = os.environ.get("ADMIN_CHAT_ID",   "5792224870")
 DASHBOARD_PORT  = int(os.environ.get("DASHBOARD_PORT", "8080"))
 
