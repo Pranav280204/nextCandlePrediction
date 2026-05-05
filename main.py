@@ -970,10 +970,8 @@ class CandlePredictor:
         all_indices = list(range(min_start, len(rows) - 1))
         if len(all_indices) > ML_TRAIN_CAP:
             sampled = sorted(random.sample(all_indices, ML_TRAIN_CAP))
-            print(f"  🤖 ML: sampling {ML_TRAIN_CAP:,} of {len(all_indices):,} candles")
         else:
             sampled = all_indices
-            print(f"  🤖 ML: using all {len(sampled):,} candles")
 
         X, y = [], []
         for step, i in enumerate(sampled):
@@ -994,7 +992,6 @@ class CandlePredictor:
             return f"Insufficient training samples: {len(X)}"
 
         try:
-            print("  🤖 Fitting RandomForest...")
             progress(1, 3, "ML training")
             scaler = StandardScaler()
             Xs = scaler.fit_transform(X)
@@ -1007,7 +1004,6 @@ class CandlePredictor:
             rf.fit(Xs, y)
             progress(2, 3, "ML training")
 
-            print("  🤖 Running 5-fold cross-validation...")
             cv_scores = cross_val_score(rf, Xs, y, cv=5, scoring="accuracy", n_jobs=1)
             progress_done("ML training")
             cv_mean   = round(cv_scores.mean() * 100, 2)
@@ -1339,7 +1335,7 @@ class CandlePredictor:
             bt.add_candle(ingest_candle)
 
             if (i + 1) % 500 == 0:
-                progress(i + 1, total, f"Backtest {i+1}/{total}")
+                progress(i + 1, total, "Backtest")
 
             if pred is None or actual == "doji": continue
             if is_flat or conf < bt.min_conf_adaptive:
@@ -1349,7 +1345,7 @@ class CandlePredictor:
             correct = pred == actual
             results.append((correct, conf, False, regime))
 
-        progress_done(f"Backtest done")
+        progress_done("Backtest")
 
         acted = [(c, conf, reg) for c, conf, sk, reg in results if not sk and c is not None]
         total_acted = len(acted); correct_count = sum(1 for c, _, _ in acted if c)
