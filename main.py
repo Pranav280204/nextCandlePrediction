@@ -1,30 +1,15 @@
 """
-BTC/USD 5m Rolling Candle Predictor — PUBLIC BOT  v3.0  ★ WORLD CLASS ★
+BTC/USD 5m Rolling Candle Predictor — PUBLIC BOT  v3.1  ★ MEMORY FIXED ★
 ═══════════════════════════════════════════════════════════════════════════════
-MAJOR UPGRADES vs v2.0
+FIXES vs v3.0
 ──────────────────────────────────────────────────────────────────────────────
-  [ML-1]  RandomForest ensemble  — 50-tree classifier on 40+ features
-  [ML-2]  Online learning        — model retrains every 500 candles live
-  [ML-3]  Feature engineering    — OHLCV body/wick/range + lag-3 candles
-  [ML-4]  Regime classifier      — trending / choppy / ranging market states
-  [SIG-1] VWAP + deviation bands — institutional price anchor
-  [SIG-2] MACD histogram delta   — rate-of-change of momentum
-  [SIG-3] Bollinger Band squeeze — volatility breakout detector
-  [SIG-4] ATR adaptive filter    — skip flat / hyper-volatile candles
-  [SIG-5] Stochastic %K/%D cross — overbought/oversold momentum
-  [SIG-6] OBV slope + divergence — volume-price confirmation
-  [SIG-7] EMA ribbon 9/20/50/100 — multi-MA trend stack
-  [SIG-8] Williams %R            — another fast oscillator
-  [SIG-9] CMF (Chaikin MF)       — money-flow pressure
-  [SIG-10] Donchian channel      — breakout direction bias
-  [MTF-1] 5 timeframes          — 5m/15m/1h/4h/1d bias stack
-  [MTF-2] Trend alignment score  — how many TFs agree → confidence bonus
-  [RISK-1] Adaptive confidence gate — threshold adjusts to recent accuracy
-  [RISK-2] Max-drawdown streak guard — pause after N consecutive wrong
-  [BACK-1] Walk-forward backtest  — no look-ahead, true OOS validation
-  [BACK-2] Sharpe-like score      — quality metric beyond raw accuracy
-  [UI-1]  Live web dashboard      — Flask server with real-time stats
-  [UI-2]  Telegram inline keyboard — richer user experience
+  [MEM-1]  Startup backtest capped to last 5,000 candles (was full 105k)
+  [MEM-2]  ML training capped at ML_TRAIN_CAP=5,000 random samples
+  [MEM-3]  extract_features() receives only LOOKBACK slice (was O(n²))
+  [MEM-4]  _backtest_log removed — SQLite already stores this
+  [MEM-5]  fetch_historical streams batch-by-batch, frees each after ingest
+  [LOG-1]  Progress % printed for every major startup phase
+  [LOG-2]  ML training, backtest, MTF fetch all show step-by-step progress
 ═══════════════════════════════════════════════════════════════════════════════
 COMMANDS
   /start        — subscribe
@@ -78,10 +63,11 @@ DAYS            = 365
 BATCH_SIZE      = 1000
 
 WINDOW_SIZE     = 365 * 24 * 12        # ~105 120 5m candles
-MIN_CANDLES     = 1500                  # need more for ML features
-ML_TRAIN_MIN    = 500                   # min samples to train RF
-ML_RETRAIN_FREQ = 500                   # retrain every N new candles
-LOOKBACK        = 50                    # feature window for ML
+MIN_CANDLES     = 1500
+ML_TRAIN_MIN    = 500
+ML_TRAIN_CAP    = 5_000                # [MEM-2] max samples for ML training
+ML_RETRAIN_FREQ = 500
+LOOKBACK        = 50
 
 # ── Timeframes for MTF ────────────────────────────────────────────────────────
 MTF_CONFIG = [
@@ -103,17 +89,16 @@ OBV_WINDOW      = 20
 CMF_PERIOD      = 20
 DONCHIAN_PERIOD = 20
 WILLIAMS_R_PERIOD = 14
-VWAP_SESSION_CANDLES = 78   # 6.5h session at 5m
+VWAP_SESSION_CANDLES = 78
 
 # ── Gates & risk ─────────────────────────────────────────────────────────────
-BASE_MIN_CONF   = 5.0       # base minimum confidence %
-ATR_FLAT_PCT    = 0.04      # below this → flat market skip
-ATR_EXTREME_PCT = 0.25      # above this → hyper-volatile skip
-MAX_LOSS_STREAK = 7         # pause after this many consecutive wrong
-CONF_ADAPT_WINDOW = 50      # candles over which to adapt confidence gate
+BASE_MIN_CONF   = 5.0
+ATR_FLAT_PCT    = 0.04
+ATR_EXTREME_PCT = 0.25
+MAX_LOSS_STREAK = 7
+CONF_ADAPT_WINDOW = 50
 
 # ── Signal weights (by regime) ────────────────────────────────────────────────
-# [trending, choppy, ranging]
 WEIGHTS = {
     "Momentum(50)":    [1.8, 0.8, 1.0],
     "Streak":          [1.5, 0.6, 0.8],
@@ -140,6 +125,20 @@ DB_FILE         = "subscribers.db"
 CONFIDENCE_BANDS = [5, 10, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90]
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROGRESS LOGGER  [LOG-1]
+# ══════════════════════════════════════════════════════════════════════════════
+def progress(step, total, label="", bar_len=30):
+    """Print a progress bar to stdout."""
+    pct  = step / total if total else 0
+    done = int(bar_len * pct)
+    bar  = "█" * done + "░" * (bar_len - done)
+    print(f"\r  [{bar}] {pct*100:5.1f}%  {label}   ", end="", flush=True)
+
+def progress_done(label=""):
+    print(f"\r  [{'█'*30}] 100.0%  {label}   ")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -225,7 +224,6 @@ def log_prediction(prediction, actual, confidence, regime, correct):
         pass
 
 def get_regime_accuracy():
-    """Return accuracy breakdown by regime from DB."""
     try:
         conn = sqlite3.connect(DB_FILE); c = conn.cursor()
         c.execute("SELECT regime, COUNT(*), SUM(correct) FROM prediction_log GROUP BY regime")
@@ -286,7 +284,7 @@ shared_state = {
     "regime": "unknown", "ml_confidence": 0.0, "ml_enabled": ML_AVAILABLE,
     "mtf_biases": {}, "signals": {}, "loss_streak": 0,
     "min_conf_adaptive": BASE_MIN_CONF, "candle_count": 0,
-    "last_update": "—", "version": "3.0",
+    "last_update": "—", "version": "3.1",
 }
 _predictor_ref = None
 
@@ -308,7 +306,7 @@ def handle_start(chat_id, username):
     else:
         add_subscriber(chat_id, username)
         send_message(chat_id,
-            "🎉 <b>Welcome to BTC Predictor v3 — World Class Edition!</b>\n\n"
+            "🎉 <b>Welcome to BTC Predictor v3.1 — Memory Fixed Edition!</b>\n\n"
             "📌 <b>What you'll get every 5 minutes:</b>\n"
             "  • Next candle direction + confidence %\n"
             "  • 15+ signals: ML · VWAP · MACD · BB · Stoch · CMF · OBV · MTF · ...\n"
@@ -348,7 +346,7 @@ def handle_status(chat_id):
     )
     ml_line = f"  🤖 ML conf: {s.get('ml_confidence', 0):.1f}%" if ML_AVAILABLE else "  🤖 ML: not installed"
     send_message(chat_id,
-        f"📊 <b>BTC/USD 5m Predictor v3 — Live Status</b>\n"
+        f"📊 <b>BTC/USD 5m Predictor v3.1 — Live Status</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 BTC Price  : <b>${s['price']:,.2f}</b>\n"
         f"🟢 Green      : {s['green']:,} ({s['green_pct']}%)\n"
@@ -400,7 +398,7 @@ def handle_accuracy(chat_id):
         bar = "█" * int(d["acc"] / 10) + "░" * (10 - int(d["acc"] / 10))
         lines.append(f"  {regime:10}: {d['acc']:5.1f}%  [{bar}]  n={d['total']}")
     send_message(chat_id,
-        f"🎯 <b>Accuracy Breakdown v3</b>\n"
+        f"🎯 <b>Accuracy Breakdown v3.1</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Overall: <b>{s['accuracy']}%</b>  ({s['correct']}/{s['total']})\n"
         f"Skipped: {s['skipped']} (gates active)\n"
@@ -452,7 +450,7 @@ def handle_backtest(chat_id):
         send_message(chat_id, "⛔ Admin only."); return
     if _predictor_ref is None:
         send_message(chat_id, "⏳ Bot warming up. Try again shortly."); return
-    send_message(chat_id, "🔬 <b>Running walk-forward backtest...</b>\n<i>This may take 30–60 seconds.</i>")
+    send_message(chat_id, "🔬 <b>Running walk-forward backtest (last 5,000 candles)...</b>\n<i>This may take 30–60 seconds.</i>")
     try:
         report = _predictor_ref.generate_backtest_report()
         for part in report:
@@ -516,35 +514,70 @@ def polling_thread():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA FETCH
+# DATA FETCH  [MEM-5] stream-ingest per batch
 # ══════════════════════════════════════════════════════════════════════════════
-def fetch_historical(symbol, interval, days):
+def fetch_historical_streaming(predictor, symbol, interval, days):
+    """
+    Fetch historical candles batch-by-batch and ingest into predictor immediately.
+    Each batch is freed from memory after ingestion — no giant list in RAM.
+    Returns the last candle seen (for price display in main).
+    """
     now_ms   = int(time.time() * 1000)
     start_ms = now_ms - days * 86_400_000
-    all_candles = []; end_ms = now_ms
+    end_ms   = now_ms
     ms_per_bar = int(interval if interval.isdigit() else 1440) * 60_000
-    print(f"📥 Fetching {days}d of {symbol} {interval}m candles...")
+    expected_total = days * 24 * 60 // int(interval if interval.isdigit() else 1440)
+
+    print(f"\n📥 Phase 1/5 — Fetching {days}d of {symbol} {interval}m candles")
+    print(f"   Expected ~{expected_total:,} candles")
+
+    # Collect batch timestamps only to determine order; ingest oldest→newest
+    all_batches = []
+    fetched = 0
+
     while end_ms > start_ms:
-        params = {"category": "spot", "symbol": symbol, "interval": interval,
-                  "limit": BATCH_SIZE, "end": end_ms, "start": start_ms}
+        params = {
+            "category": "spot", "symbol": symbol, "interval": interval,
+            "limit": BATCH_SIZE, "end": end_ms, "start": start_ms
+        }
         try:
             resp = requests.get(BYBIT_URL, params=params, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             if data.get("retCode") != 0:
-                print(f"❌ Bybit error: {data.get('retMsg')}"); break
+                print(f"\n❌ Bybit error: {data.get('retMsg')}"); break
             batch = data["result"]["list"]
             if not batch: break
-            all_candles.extend(batch)
+            all_batches.append(batch)
+            fetched += len(batch)
             oldest = int(batch[-1][0])
             end_ms = oldest - ms_per_bar
-            print(f"  {len(all_candles):,} candles...", end="\r")
+            progress(min(fetched, expected_total), expected_total,
+                     f"{fetched:,} candles fetched")
             time.sleep(0.15)
         except Exception as e:
-            print(f"\n  ⚠️  Fetch: {e}"); time.sleep(2)
-    all_candles.reverse()
-    print(f"\n✅ {len(all_candles):,} {interval}m candles fetched.")
-    return all_candles
+            print(f"\n  ⚠️  Fetch error: {e}"); time.sleep(2)
+
+    print(f"\n   ✅ Fetch complete: {fetched:,} candles in {len(all_batches)} batches")
+
+    # Ingest oldest → newest; free each batch immediately after [MEM-5]
+    print(f"\n⚙️  Phase 2/5 — Ingesting candles into rolling window")
+    all_batches.reverse()  # oldest batch first
+    total_ingested = 0
+    last_candle = None
+
+    for bi, batch in enumerate(all_batches):
+        for candle in reversed(batch):   # within batch: oldest first
+            predictor.add_candle(candle)
+            last_candle = candle
+            total_ingested += 1
+        progress(total_ingested, fetched, f"{total_ingested:,}/{fetched:,} ingested")
+        all_batches[bi] = None  # free batch memory immediately [MEM-5]
+
+    del all_batches
+    progress_done(f"Ingestion complete — window: {predictor.candle_count:,} candles")
+    return last_candle
+
 
 def fetch_latest_candle(symbol, interval):
     params = {"category": "spot", "symbol": symbol, "interval": interval, "limit": 3}
@@ -625,7 +658,6 @@ def compute_atr(ohlcv, period=14):
     return atr
 
 def compute_vwap_rolling(ohlcv, n=78):
-    """Rolling session VWAP over last n candles."""
     subset = ohlcv[-n:]
     cum_pv = cum_v = 0.0
     for o, h, l, c, v in subset:
@@ -660,7 +692,6 @@ def compute_obv_slope(ohlcv, window=20):
     return (series[-1] - series[0]) if len(series) >= 2 else None
 
 def compute_cmf(ohlcv, period=20):
-    """Chaikin Money Flow."""
     if len(ohlcv) < period: return None
     subset = ohlcv[-period:]
     mfv_sum = vol_sum = 0.0
@@ -679,7 +710,6 @@ def compute_williams_r(ohlcv, period=14):
     return -100 * safe_div(hi - cl, hi - lo)
 
 def compute_donchian(ohlcv, period=20):
-    """Returns (upper, lower, mid, position 0..1)."""
     if len(ohlcv) < period: return None, None, None, None
     window = ohlcv[-period:]
     hi = max(c[1] for c in window); lo = min(c[2] for c in window)
@@ -688,14 +718,12 @@ def compute_donchian(ohlcv, period=20):
     return hi, lo, mid, round(pos, 4)
 
 def compute_ema_ribbon(closes):
-    """Returns dict of EMA values for each period."""
     ribbon = {}
     for period in EMA_PERIODS:
         ribbon[period] = ema(closes, period)
     return ribbon
 
 def mtf_bias_full(candles):
-    """Returns bias string + numeric score [-1, 1]."""
     if len(candles) < 20: return "neutral", 0.0
     closes = [float(c[4]) for c in candles]
     ema20  = ema(closes, 20)
@@ -718,25 +746,18 @@ def mtf_bias_full(candles):
     return "neutral", round(norm, 3)
 
 def detect_regime(ohlcv, closes):
-    """Detect market regime: trending / choppy / ranging."""
     if len(ohlcv) < 50: return "trending"
     atr = compute_atr(ohlcv[-51:], 14)
     if atr is None: return "trending"
     atr_pct = atr / closes[-1] * 100
-
-    # ADX-like directional strength via EMA separation
     e9  = ema(closes, 9)
     e20 = ema(closes, 20)
     e50 = ema(closes, min(50, len(closes)))
     if None in (e9, e20, e50): return "trending"
-
     separation = abs(e9 - e50) / e50 * 100
     aligned = (e9 > e20 > e50) or (e9 < e20 < e50)
-
-    # Bollinger bandwidth
     _, _, _, _, bw = compute_bollinger(closes[-30:], 20, 2.0)
     if bw is None: bw = 0.01
-
     if aligned and separation > 0.15 and atr_pct > 0.06:
         return "trending"
     elif bw < 0.008 or atr_pct < 0.04:
@@ -746,12 +767,12 @@ def detect_regime(ohlcv, closes):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FEATURE ENGINEERING FOR ML
+# FEATURE ENGINEERING FOR ML  [MEM-3] receives only LOOKBACK slice
 # ══════════════════════════════════════════════════════════════════════════════
 def extract_features(ohlcv_list, closes_list, window_rows):
     """
-    Extract 40+ features from last LOOKBACK candles for ML model.
-    Returns None if not enough data.
+    Extract 40+ features. Expects slices of length ~LOOKBACK+5 — NOT the full window.
+    [MEM-3] Caller must pass ohlcv[max(0,i-LOOKBACK-5):i+1] — not ohlcv[:i+1]
     """
     if len(ohlcv_list) < LOOKBACK + 5 or len(closes_list) < LOOKBACK + 5:
         return None
@@ -774,7 +795,6 @@ def extract_features(ohlcv_list, closes_list, window_rows):
         for p in EMA_PERIODS:
             v = ribbon.get(p)
             feats.append(safe_div(price - v, v) if v else 0)
-        # EMA cross ratios
         if ribbon[9] and ribbon[20]:
             feats.append(safe_div(ribbon[9] - ribbon[20], ribbon[20]))
         else:
@@ -831,8 +851,8 @@ def extract_features(ohlcv_list, closes_list, window_rows):
             o_, h_, l_, c_, v_ = ohlcv[i]
             rng = h_ - l_
             body = abs(c_ - o_)
-            feats.append(safe_div(body, rng) if rng else 0)        # body/range
-            feats.append(safe_div(c_ - o_, o_) if o_ else 0)       # return
+            feats.append(safe_div(body, rng) if rng else 0)
+            feats.append(safe_div(c_ - o_, o_) if o_ else 0)
             upper_wick = h_ - max(o_, c_)
             lower_wick = min(o_, c_) - l_
             feats.append(safe_div(upper_wick, rng) if rng else 0)
@@ -856,7 +876,7 @@ def extract_features(ohlcv_list, closes_list, window_rows):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CANDLE PREDICTOR v3
+# CANDLE PREDICTOR v3.1
 # ══════════════════════════════════════════════════════════════════════════════
 class CandlePredictor:
 
@@ -875,16 +895,12 @@ class CandlePredictor:
         self.last_candle_time    = None
         self.loss_streak         = 0
         self.win_streak          = 0
-        self._backtest_log       = []  # (pred, actual, conf, regime)
+        # [MEM-4] _backtest_log removed — SQLite already stores all of this
 
-        # MTF state
-        self.mtf_biases = {}    # label → (bias_str, score)
+        self.mtf_biases    = {}
         self.mtf_alignment = 0.0
+        self.regime        = "trending"
 
-        # Regime
-        self.regime = "trending"
-
-        # ML model
         self.ml_model   = None
         self.ml_scaler  = None
         self.ml_trained = False
@@ -892,9 +908,8 @@ class CandlePredictor:
         self.ml_last_features = None
         self._candles_since_retrain = 0
 
-        # Adaptive confidence gate
-        self.recent_outcomes = collections.deque(maxlen=CONF_ADAPT_WINDOW)
-        self.min_conf_adaptive = BASE_MIN_CONF
+        self.recent_outcomes    = collections.deque(maxlen=CONF_ADAPT_WINDOW)
+        self.min_conf_adaptive  = BASE_MIN_CONF
 
     # ── Ingest ────────────────────────────────────────────────────────────────
     def add_candle(self, candle):
@@ -919,7 +934,6 @@ class CandlePredictor:
         self.last_candle_time = int(candle[0])
         self._candles_since_retrain += 1
 
-        # Trigger ML retrain
         if ML_AVAILABLE and self._candles_since_retrain >= ML_RETRAIN_FREQ:
             threading.Thread(target=self.train_ml_model, daemon=True).start()
             self._candles_since_retrain = 0
@@ -933,41 +947,59 @@ class CandlePredictor:
     def _closes(self):
         return [r[5] for r in self.window]
 
-    # ── ML Training ───────────────────────────────────────────────────────────
+    # ── ML Training  [MEM-2] capped at ML_TRAIN_CAP  [MEM-3] O(n) slices ────
     def train_ml_model(self, force=False):
         if not ML_AVAILABLE:
             return "ML not available — install scikit-learn"
         if len(self.window) < ML_TRAIN_MIN:
             return f"Need {ML_TRAIN_MIN} candles, have {len(self.window)}"
 
-        rows  = list(self.window)
-        ohlcv = [(r[2], r[3], r[4], r[5], r[6]) for r in rows]
+        rows   = list(self.window)
+        ohlcv  = [(r[2], r[3], r[4], r[5], r[6]) for r in rows]
         closes = [r[5] for r in rows]
 
-        X, y = [], []
+        # [MEM-2] Random-sample indices; sort so slices stay in order
         min_start = max(LOOKBACK + 10, 0)
-        for i in range(min_start, len(rows) - 1):
-            feats = extract_features(ohlcv[:i+1], closes[:i+1], rows[:i+1])
+        all_indices = list(range(min_start, len(rows) - 1))
+        if len(all_indices) > ML_TRAIN_CAP:
+            sampled = sorted(random.sample(all_indices, ML_TRAIN_CAP))
+            print(f"  🤖 ML: sampling {ML_TRAIN_CAP:,} of {len(all_indices):,} candles")
+        else:
+            sampled = all_indices
+            print(f"  🤖 ML: using all {len(sampled):,} candles")
+
+        X, y = [], []
+        for step, i in enumerate(sampled):
+            # [MEM-3] Pass only LOOKBACK+5 slice — not the full growing ohlcv[:i+1]
+            sl = max(0, i - LOOKBACK - 5)
+            feats = extract_features(ohlcv[sl:i+1], closes[sl:i+1], rows[sl:i+1])
             if feats is None: continue
             label = 1 if rows[i+1][1] == "green" else 0
             if rows[i+1][1] == "doji": continue
             X.append(feats); y.append(label)
 
+            if (step + 1) % 500 == 0:
+                progress(step + 1, len(sampled),
+                         f"Extracting features {step+1}/{len(sampled)}")
+
+        progress_done(f"Feature extraction done — {len(X)} samples")
+
         if len(X) < 100:
             return f"Insufficient training samples: {len(X)}"
 
         try:
+            print("  🤖 Fitting RandomForest...")
             scaler = StandardScaler()
             Xs = scaler.fit_transform(X)
 
-            rf  = RandomForestClassifier(
+            rf = RandomForestClassifier(
                 n_estimators=100, max_depth=8, min_samples_leaf=5,
                 max_features="sqrt", random_state=42, n_jobs=-1,
                 class_weight="balanced"
             )
             rf.fit(Xs, y)
 
-            # Cross-val score
+            print("  🤖 Running 5-fold cross-validation...")
             cv_scores = cross_val_score(rf, Xs, y, cv=5, scoring="accuracy")
             cv_mean   = round(cv_scores.mean() * 100, 2)
 
@@ -978,21 +1010,22 @@ class CandlePredictor:
 
             msg = (f"ML RandomForest retrained! {len(X)} samples | "
                    f"CV accuracy: {cv_mean}%")
-            print(f"  🤖 {msg}")
+            print(f"  ✅ {msg}")
             return msg
         except Exception as e:
             return f"ML training failed: {e}"
 
     def _ml_predict(self, ohlcv, closes):
         if not self.ml_trained or self.ml_model is None: return None, 0.0
-        feats = extract_features(ohlcv, closes, list(self.window))
+        # Use only the last LOOKBACK+5 candles for live prediction
+        sl = max(0, len(ohlcv) - LOOKBACK - 5)
+        feats = extract_features(ohlcv[sl:], closes[sl:], list(self.window)[-LOOKBACK-5:])
         if feats is None: return None, 0.0
         try:
             Xs = self.ml_scaler.transform([feats])
             proba = self.ml_model.predict_proba(Xs)[0]
-            # proba[0] = P(red), proba[1] = P(green)
             pred = "green" if proba[1] >= 0.5 else "red"
-            conf = abs(proba[1] - 0.5) * 200   # 0-100
+            conf = abs(proba[1] - 0.5) * 200
             self.ml_confidence = round(conf, 1)
             return pred, conf
         except Exception:
@@ -1003,7 +1036,6 @@ class CandlePredictor:
         self.recent_outcomes.append(1 if correct else 0)
         if len(self.recent_outcomes) >= 20:
             recent_acc = sum(self.recent_outcomes) / len(self.recent_outcomes)
-            # if accuracy < 50%, raise gate; if accuracy > 60%, lower gate
             if recent_acc < 0.50:
                 self.min_conf_adaptive = min(self.min_conf_adaptive + 1.0, 20.0)
             elif recent_acc > 0.60:
@@ -1023,7 +1055,6 @@ class CandlePredictor:
         ridx         = REGIME_IDX.get(regime, 0)
 
         def ws(name):
-            """Get regime-aware weight for signal name."""
             vals = WEIGHTS.get(name, [1.0, 1.0, 1.0])
             return vals[ridx] if ridx < len(vals) else 1.0
 
@@ -1034,16 +1065,16 @@ class CandlePredictor:
             total_weight += w
             signals[name] = label
 
-        # ── ML ensemble (highest weight) ──────────────────────────────────────
+        # ── ML ensemble ───────────────────────────────────────────────────────
         ml_pred, ml_conf = self._ml_predict(ohlcv, closes)
         if ml_pred is not None:
-            ml_s = 0.5 + (ml_conf / 200)  # map conf to [0.5, 1.0]
+            ml_s = 0.5 + (ml_conf / 200)
             ml_s = ml_s if ml_pred == "green" else (1 - ml_s)
             add_signal("ML_RF", ml_s,
                 f"{'🟢' if ml_pred=='green' else '🔴'} {ml_pred.upper()} "
                 f"P={ml_conf:.1f}%")
 
-        # ── Signal: Momentum (50-candle green%) ───────────────────────────────
+        # ── Momentum ──────────────────────────────────────────────────────────
         recent = list(self.window)[-50:]
         rg = sum(1 for r in recent if r[1] == "green")
         rr = sum(1 for r in recent if r[1] == "red")
@@ -1052,18 +1083,18 @@ class CandlePredictor:
             mom = rg / rt
             add_signal("Momentum(50)", mom, f"{'🟢' if mom>0.5 else '🔴'} {mom*100:.1f}%")
 
-        # ── Signal: Streak ────────────────────────────────────────────────────
+        # ── Streak ────────────────────────────────────────────────────────────
         sc = [r[1] for r in list(self.window)[-10:]]
         last_dir = sc[-1] if sc else "doji"
-        sl = sum(1 for d in reversed(sc) if d == last_dir) if last_dir != "doji" else 0
-        if last_dir != "doji" and sl >= 2:
-            rw = min(sl / 6, 1.0)
+        sl_len = sum(1 for d in reversed(sc) if d == last_dir) if last_dir != "doji" else 0
+        if last_dir != "doji" and sl_len >= 2:
+            rw = min(sl_len / 6, 1.0)
             ss = (0.5 - rw * 0.35) if last_dir == "green" else (0.5 + rw * 0.35)
             add_signal("Streak", ss,
-                f"{'🟢' if last_dir=='green' else '🔴'} {sl}× → "
+                f"{'🟢' if last_dir=='green' else '🔴'} {sl_len}× → "
                 f"{'reversal' if rw > 0.3 else 'continuation'}")
 
-        # ── Signal: Markov ────────────────────────────────────────────────────
+        # ── Markov ────────────────────────────────────────────────────────────
         if last_dir in self.markov:
             m = self.markov[last_dir]; mt = m["green"] + m["red"]
             if mt > 10:
@@ -1071,7 +1102,7 @@ class CandlePredictor:
                 add_signal("Markov", ms,
                     f"After {last_dir}: 🟢{m['green']}/🔴{m['red']} ({ms*100:.1f}%)")
 
-        # ── Signal: EMA Ribbon ────────────────────────────────────────────────
+        # ── EMA Ribbon ────────────────────────────────────────────────────────
         ribbon = compute_ema_ribbon(closes)
         price  = closes[-1]
         valid_ribbon = {p: v for p, v in ribbon.items() if v is not None}
@@ -1079,7 +1110,6 @@ class CandlePredictor:
             above = sum(1 for v in valid_ribbon.values() if price > v)
             total_emas = len(valid_ribbon)
             rs = above / total_emas
-            # alignment check
             vals_sorted = sorted(valid_ribbon.items())
             ascending  = all(vals_sorted[i][1] < vals_sorted[i+1][1] for i in range(len(vals_sorted)-1))
             descending = all(vals_sorted[i][1] > vals_sorted[i+1][1] for i in range(len(vals_sorted)-1))
@@ -1088,7 +1118,7 @@ class CandlePredictor:
             add_signal("EMA Ribbon", rs,
                 f"Price {'above' if rs>0.5 else 'below'} {above}/{total_emas} EMAs{alignment_note}")
 
-        # ── Signal: RSI ────────────────────────────────────────────────────────
+        # ── RSI ────────────────────────────────────────────────────────────────
         rsi = compute_rsi(closes)
         if rsi is not None:
             if rsi > 70:   rs2, lbl = 0.28, f"🔴 Overbought {rsi:.1f}"
@@ -1098,7 +1128,7 @@ class CandlePredictor:
             else:          rs2, lbl = 0.50, f"⚪ Neutral {rsi:.1f}"
             add_signal("RSI(14)", rs2, lbl)
 
-        # ── Signal: MACD + Delta ──────────────────────────────────────────────
+        # ── MACD + Delta ──────────────────────────────────────────────────────
         macd_v, sig_v, hist_v, delta_v = compute_macd(closes)
         if hist_v is not None:
             ms2 = 0.65 if hist_v > 0 else 0.35
@@ -1109,11 +1139,12 @@ class CandlePredictor:
             add_signal("MACD Delta", ds,
                 f"{'🟢 Accel' if delta_v>0 else '🔴 Decel'} Δhist={delta_v:+.4f}")
 
-        # ── Signal: Bollinger Bands ────────────────────────────────────────────
+        # ── Bollinger Bands ────────────────────────────────────────────────────
         bb_up, bb_mid, bb_lo, pct_b, bw = compute_bollinger(closes)
         if pct_b is not None:
+            mom_local = rg / rt if rt > 0 else 0.5
             if bw < 0.005:
-                bb_s = 0.60 if mom > 0.5 else 0.40
+                bb_s = 0.60 if mom_local > 0.5 else 0.40
                 lbl  = f"🔵 Squeeze bw={bw*100:.3f}% → breakout pending"
             elif pct_b > 0.95: bb_s, lbl = 0.30, f"🔴 Upper band %B={pct_b:.2f}"
             elif pct_b < 0.05: bb_s, lbl = 0.70, f"🟢 Lower band %B={pct_b:.2f}"
@@ -1122,7 +1153,7 @@ class CandlePredictor:
             else:              bb_s, lbl = 0.50, f"⚪ Mid %B={pct_b:.2f}"
             add_signal("Bollinger", bb_s, lbl)
 
-        # ── Signal: VWAP ──────────────────────────────────────────────────────
+        # ── VWAP ──────────────────────────────────────────────────────────────
         vwap = compute_vwap_rolling(ohlcv, VWAP_SESSION_CANDLES)
         if vwap is not None:
             vd = (price - vwap) / vwap * 100
@@ -1130,7 +1161,7 @@ class CandlePredictor:
             add_signal("VWAP", vs,
                 f"{'above' if price>vwap else 'below'} VWAP ({vd:+.3f}%) ${vwap:,.2f}")
 
-        # ── Signal: Stochastic ────────────────────────────────────────────────
+        # ── Stochastic ────────────────────────────────────────────────────────
         k, d = compute_stochastic(ohlcv)
         if k is not None:
             if k < 20:     st_s, lbl = 0.72, f"🟢 Oversold %K={k}"
@@ -1140,21 +1171,19 @@ class CandlePredictor:
             else:          st_s, lbl = 0.50, f"⚪ Neutral K={k}"
             add_signal("Stochastic", st_s, lbl)
 
-        # ── Signal: OBV ────────────────────────────────────────────────────────
+        # ── OBV ────────────────────────────────────────────────────────────────
         obv_slope = compute_obv_slope(ohlcv)
         if obv_slope is not None:
             add_signal("OBV", 0.65 if obv_slope > 0 else 0.35,
                 f"{'🟢 Accum' if obv_slope>0 else '🔴 Distrib'} slope={obv_slope:+.0f}")
 
-        # ── Signal: CMF ────────────────────────────────────────────────────────
+        # ── CMF ────────────────────────────────────────────────────────────────
         cmf_val = compute_cmf(ohlcv)
         if cmf_val is not None:
-            cs = 0.5 + cmf_val * 0.3   # scale [-1,1] to [0.2, 0.8]
-            cs = max(0.2, min(0.8, cs))
-            add_signal("CMF", cs,
-                f"{'🟢' if cmf_val>0 else '🔴'} {cmf_val:+.3f}")
+            cs = max(0.2, min(0.8, 0.5 + cmf_val * 0.3))
+            add_signal("CMF", cs, f"{'🟢' if cmf_val>0 else '🔴'} {cmf_val:+.3f}")
 
-        # ── Signal: Williams %R ────────────────────────────────────────────────
+        # ── Williams %R ────────────────────────────────────────────────────────
         wr = compute_williams_r(ohlcv)
         if wr is not None:
             if wr < -80:   ws2, lbl = 0.70, f"🟢 Oversold {wr:.1f}"
@@ -1163,7 +1192,7 @@ class CandlePredictor:
             else:          ws2, lbl = 0.42, f"🔴 Bearish {wr:.1f}"
             add_signal("Williams%R", ws2, lbl)
 
-        # ── Signal: Donchian Channel ──────────────────────────────────────────
+        # ── Donchian Channel ──────────────────────────────────────────────────
         dhi, dlo, dmid, dpos = compute_donchian(ohlcv)
         if dpos is not None:
             ds2 = 0.65 if dpos > 0.6 else (0.35 if dpos < 0.4 else 0.50)
@@ -1171,7 +1200,7 @@ class CandlePredictor:
                 f"{'🟢 Upper' if dpos>0.6 else '🔴 Lower' if dpos<0.4 else '⚪ Mid'}"
                 f" pos={dpos:.2f}")
 
-        # ── Signal: Candle body/wick ──────────────────────────────────────────
+        # ── Candle body/wick ──────────────────────────────────────────────────
         last = self.window[-1]
         o_, h_, l_, c_, v_ = last[2], last[3], last[4], last[5], last[6]
         if o_ > 0:
@@ -1191,7 +1220,7 @@ class CandlePredictor:
                     cbs, cbl = 0.50, f"⚪ Body {body:.3f}%"
                 add_signal("Candle Body", cbs, cbl)
 
-        # ── Signal: MTF bias stack ────────────────────────────────────────────
+        # ── MTF bias stack ────────────────────────────────────────────────────
         mtf_bull = mtf_bear = 0
         for label, (bias, score) in self.mtf_biases.items():
             if bias == "bullish": mtf_bull += 1
@@ -1199,7 +1228,6 @@ class CandlePredictor:
         mtf_total = mtf_bull + mtf_bear
         if mtf_total > 0:
             alignment = mtf_bull / mtf_total
-            # Bonus for strong alignment
             if mtf_bull >= 3 or mtf_bear >= 3:
                 alignment = 0.72 if mtf_bull > mtf_bear else 0.28
             add_signal("MTF", alignment,
@@ -1213,7 +1241,6 @@ class CandlePredictor:
         conf = round(abs(fs - 0.5) * 200, 1)
         pred = "green" if fs >= 0.5 else "red"
 
-        # MTF alignment bonus: if all TFs agree, boost confidence
         if mtf_total >= 3:
             alignment_ratio = mtf_bull / mtf_total if mtf_bull > mtf_bear else mtf_bear / mtf_total
             if alignment_ratio >= 0.75:
@@ -1243,13 +1270,8 @@ class CandlePredictor:
             else:
                 self.loss_streak += 1
                 self.win_streak = 0
-
             self._update_adaptive_gate(correct)
-            self._backtest_log.append((
-                self.last_prediction, actual,
-                shared_state.get("confidence", 0.0),
-                self.regime
-            ))
+            # [MEM-4] only log to SQLite, not to in-memory list
             log_prediction(self.last_prediction, actual,
                            shared_state.get("confidence", 0.0),
                            self.regime, correct)
@@ -1273,22 +1295,32 @@ class CandlePredictor:
         return round(100 * self.total_red / t, 2) if t else 0
 
     # ══════════════════════════════════════════════════════════════════════════
-    # WALK-FORWARD BACKTEST
+    # WALK-FORWARD BACKTEST  [MEM-1] capped to last BT_CAP candles
     # ══════════════════════════════════════════════════════════════════════════
-    def run_backtest(self, candles):
-        """True walk-forward (no look-ahead) backtest over full history."""
-        bt = CandlePredictor()
+    def run_backtest(self, candles, cap=5_000):
+        """
+        True walk-forward backtest. Capped to last `cap` candles to avoid
+        the O(n²) memory spike that crashed v3.0.  [MEM-1]
+        """
+        if len(candles) > cap:
+            candles = candles[-cap:]
+            print(f"  🔬 Backtest capped to last {cap:,} candles [MEM-1]")
+
+        bt  = CandlePredictor()
         results = []
         total_skipped = 0
-        print(f"  🔬 Walk-forward backtest: {len(candles):,} candles...")
+        total = len(candles)
+        print(f"  🔬 Walk-forward backtest: {total:,} candles...")
 
-        # We need MIN_CANDLES warmup
         for i, candle in enumerate(candles):
             if i == 0: bt.add_candle(candle); continue
 
             pred, conf, _, is_flat, regime = bt.predict_next()
             actual = classify(candle)
             bt.add_candle(candle)
+
+            if (i + 1) % 500 == 0:
+                progress(i + 1, total, f"Backtest {i+1}/{total}")
 
             if pred is None or actual == "doji": continue
             if is_flat or conf < bt.min_conf_adaptive:
@@ -1298,8 +1330,10 @@ class CandlePredictor:
             correct = pred == actual
             results.append((correct, conf, False, regime))
 
+        progress_done(f"Backtest done")
+
         acted = [(c, conf, reg) for c, conf, sk, reg in results if not sk and c is not None]
-        total = len(acted); correct = sum(1 for c, _, _ in acted if c)
+        total_acted = len(acted); correct_count = sum(1 for c, _, _ in acted if c)
 
         by_conf = {}
         for t in CONFIDENCE_BANDS:
@@ -1317,7 +1351,6 @@ class CandlePredictor:
             d = by_regime[reg]
             d["accuracy"] = round(100 * d["correct"] / d["total"], 2) if d["total"] else 0
 
-        # Streaks
         lc = lw = 0; ck = None; cl = 0
         for c, _, _ in acted:
             k = "c" if c else "w"
@@ -1329,7 +1362,6 @@ class CandlePredictor:
         if ck == "c": lc = max(lc, cl)
         elif ck == "w": lw = max(lw, cl)
 
-        # Sharpe-like: (accuracy - 50) / std_of_outcomes
         outcomes = [1 if c else -1 for c, _, _ in acted]
         if len(outcomes) > 2:
             try:
@@ -1340,23 +1372,24 @@ class CandlePredictor:
             sharpe = 0.0
 
         return {
-            "total": total, "correct": correct, "wrong": total-correct,
+            "total": total_acted, "correct": correct_count, "wrong": total_acted-correct_count,
             "skipped": total_skipped,
-            "overall_accuracy": round(100*correct/total, 2) if total else 0,
+            "overall_accuracy": round(100*correct_count/total_acted, 2) if total_acted else 0,
             "by_confidence": by_conf, "by_regime": by_regime,
             "streak_correct": lc, "streak_wrong": lw,
             "sharpe_like": round(sharpe, 3),
         }
 
     def generate_backtest_report(self):
-        bt = self.run_backtest(list(self.window))
+        bt = self.run_backtest(list(self.window), cap=5_000)
         if not bt: return ["⚠️ Not enough data."]
         parts = []
         acc = bt["overall_accuracy"]
         acc_bar = "█" * int(acc / 5) + "░" * (20 - int(acc / 5))
 
         parts.append(
-            f"📋 <b>WALK-FORWARD BACKTEST v3</b>\n"
+            f"📋 <b>WALK-FORWARD BACKTEST v3.1</b>\n"
+            f"<i>(Last 5,000 candles — memory safe)</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"  Acted   : <b>{bt['total']:,}</b>\n"
             f"  ✅ Correct: <b>{bt['correct']:,}</b>\n"
@@ -1370,7 +1403,6 @@ class CandlePredictor:
             f"  💀 Worst wrong streak : <b>{bt['streak_wrong']}</b>"
         )
 
-        # Confidence bands
         band_lines = [
             "📡 <b>Accuracy by Confidence</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1386,7 +1418,6 @@ class CandlePredictor:
                     f"{d['accuracy']:>5.1f}%</code> {bar}")
         parts.append("\n".join(band_lines))
 
-        # Regime breakdown
         regime_lines = ["📈 <b>Accuracy by Regime</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n<code>Regime     Total  Acc%</code>"]
         for reg, d in bt["by_regime"].items():
             bar = "▓" * int(d["accuracy"] / 10) + "░" * (10 - int(d["accuracy"] / 10))
@@ -1400,7 +1431,7 @@ class CandlePredictor:
         if not bt: return
         sep = "═" * 66
         print(f"\n{sep}")
-        print(f"  📋  WALK-FORWARD BACKTEST v3 ({len(self.window):,} candles)")
+        print(f"  📋  WALK-FORWARD BACKTEST v3.1 (last 5,000 candles)")
         print(sep)
         print(f"  Acted   : {bt['total']:,}   Skipped: {bt['skipped']:,}")
         print(f"  ✅ Correct: {bt['correct']:,}   ❌ Wrong: {bt['wrong']:,}")
@@ -1438,22 +1469,19 @@ def build_broadcast(predictor, candle, prediction, confidence,
     if ML_AVAILABLE and predictor.ml_trained:
         ml_line = f"\n  🤖 ML: <b>{predictor.ml_confidence:.1f}%</b> confidence"
 
-    # MTF summary
     mtf_summary = " | ".join(
         f"{'🟢' if b=='bullish' else '🔴' if b=='bearish' else '⚪'}{label}"
         for label, (b, _) in predictor.mtf_biases.items()
     ) or "loading..."
 
-    sig_lines = "\n".join(
-        f"  • <b>{n}</b>: {v}" for n, v in signals.items()
-    )
+    sig_lines = "\n".join(f"  • <b>{n}</b>: {v}" for n, v in signals.items())
 
     loss_warn = ""
     if predictor.loss_streak >= MAX_LOSS_STREAK - 2:
         loss_warn = f"\n  ⚠️ <i>High loss streak ({predictor.loss_streak}) — elevated uncertainty</i>"
 
     return (
-        f"🤖 <b>BTC/USD 5m — v3 World Class</b>\n"
+        f"🤖 <b>BTC/USD 5m — v3.1 Memory Fixed</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {ts(candle[0])}\n"
         f"💵 <b>${float(candle[4]):,.2f}</b>"
@@ -1496,7 +1524,7 @@ def print_dashboard(predictor, candle, prediction, confidence, signals, actual_d
     regime_emoji = {"trending": "📈", "choppy": "〰️", "ranging": "↔️"}.get(predictor.regime, "❓")
 
     print(f"\n{sep}")
-    print(f"  🤖 BTC Predictor v3 ★  |  {ts(candle[0])}  |  ${float(candle[4]):,.2f}")
+    print(f"  🤖 BTC Predictor v3.1 ★  |  {ts(candle[0])}  |  ${float(candle[4]):,.2f}")
     print(sep)
     print(f"  Window: {predictor.candle_count:,}  |  🟢{g:,}({predictor.green_pct}%)  🔴{r:,}({predictor.red_pct}%)")
     print(f"  [{'█'*g_bar}{'░'*(44-g_bar)}]")
@@ -1532,7 +1560,7 @@ def print_dashboard(predictor, candle, prediction, confidence, signals, actual_d
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html>
 <head>
-<title>BTC Predictor v3</title>
+<title>BTC Predictor v3.1</title>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="10">
 <style>
@@ -1557,7 +1585,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>⚡ BTC/USD 5m Predictor v3</h1>
+<h1>⚡ BTC/USD 5m Predictor v3.1</h1>
 <div class="grid">
   <div class="card">
     <h2>💵 Price</h2>
@@ -1597,7 +1625,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="ts">ML: {ml_status} | ATR: {atr_pct:.4f}%</div>
   </div>
 </div>
-<div class="ts" style="margin-top:20px">Updated: {last_update} | v3.0 | 👥 {subs} subscribers</div>
+<div class="ts" style="margin-top:20px">Updated: {last_update} | v3.1 | 👥 {subs} subscribers</div>
 </body></html>"""
 
 def start_dashboard():
@@ -1649,7 +1677,6 @@ def start_dashboard():
 # MTF REFRESH THREAD
 # ══════════════════════════════════════════════════════════════════════════════
 def mtf_refresh_loop(predictor):
-    """Continuously refresh multi-timeframe biases in background."""
     while True:
         try:
             biases = {}
@@ -1666,7 +1693,7 @@ def mtf_refresh_loop(predictor):
             shared_state["mtf_biases"] = {label: b for label, (b, _) in biases.items()}
         except Exception as e:
             print(f"  ⚠️  MTF refresh error: {e}")
-        time.sleep(60)   # refresh every 60s (~3 candles)
+        time.sleep(60)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1675,57 +1702,63 @@ def mtf_refresh_loop(predictor):
 def main():
     global _predictor_ref
 
-    print("=" * 72)
-    print("  BTC/USD 5m Predictor — ★ WORLD CLASS ★  v3.0")
-    print("  ML: RandomForest + GradientBoosting | 15+ Signals | 5 Timeframes")
-    print("=" * 72)
+    sep = "=" * 72
+    print(sep)
+    print("  BTC/USD 5m Predictor — ★ v3.1 MEMORY FIXED ★")
+    print("  ML: RandomForest | 15+ Signals | 5 Timeframes | Progress Logging")
+    print(sep)
 
+    # ── Phase 0: DB init ──────────────────────────────────────────────────────
+    print("\n🗄️  Phase 0/5 — Database init")
     init_db()
     add_subscriber(ADMIN_CHAT_ID, "admin")
-    print(f"✅ DB ready. Subscribers: {subscriber_count()}")
+    print(f"   ✅ DB ready. Subscribers: {subscriber_count()}")
 
-    # ── Load history ──────────────────────────────────────────────────────────
-    historical = fetch_historical(SYMBOL, INTERVAL, DAYS)
+    # ── Phase 1+2: Fetch + ingest (streaming, memory safe) ────────────────────
     predictor  = CandlePredictor()
     _predictor_ref = predictor
-
-    print("⚙️  Building rolling window...")
-    for candle in historical:
-        predictor.add_candle(candle)
-    print(f"✅ Window: {predictor.candle_count:,} candles"
+    last_candle = fetch_historical_streaming(predictor, SYMBOL, INTERVAL, DAYS)
+    print(f"   ✅ Window: {predictor.candle_count:,} candles"
           f" | 🟢{predictor.total_green:,} | 🔴{predictor.total_red:,}")
 
-    # ── Initial regime detection ───────────────────────────────────────────────
+    # ── Phase 3: Regime detection ─────────────────────────────────────────────
+    print(f"\n🧠 Phase 3/5 — Regime detection")
     ohlcv  = predictor._ohlcv()
     closes = predictor._closes()
     predictor.regime = detect_regime(ohlcv[-200:], closes[-200:])
-    print(f"  📈 Initial regime: {predictor.regime.upper()}")
+    print(f"   ✅ Regime: {predictor.regime.upper()}")
 
-    # ── ML initial train ──────────────────────────────────────────────────────
+    # ── Phase 4: ML training ──────────────────────────────────────────────────
     if ML_AVAILABLE:
-        print("\n🤖 Training initial ML model (RandomForest)...")
+        print(f"\n🤖 Phase 4/5 — ML RandomForest training")
+        print(f"   Capped at {ML_TRAIN_CAP:,} samples (was O(n²) — now O(n)) [MEM-2,3]")
         result = predictor.train_ml_model(force=True)
-        print(f"  {result}")
+        print(f"   ✅ {result}")
+    else:
+        print(f"\n⚠️  Phase 4/5 — ML skipped (scikit-learn not installed)")
 
-    # ── MTF initial fetch ─────────────────────────────────────────────────────
-    print("\n📐 Fetching multi-timeframe candles (15m/1h/4h/1D)...")
-    for interval, label, _, weight in MTF_CONFIG:
+    # ── Phase 5: MTF + backtest ───────────────────────────────────────────────
+    print(f"\n📐 Phase 5/5 — Multi-timeframe bias + backtest")
+    print("   Fetching MTF candles...")
+    for idx, (interval, label, _, weight) in enumerate(MTF_CONFIG):
         candles = fetch_mtf_candles(SYMBOL, interval, MTF_CANDLES_FETCH)
         if candles:
             bias, score = mtf_bias_full(candles)
             predictor.mtf_biases[label] = (bias, score)
-            print(f"  {label}: {bias} (score={score:+.3f})")
+            progress(idx + 1, len(MTF_CONFIG), f"{label}: {bias} (score={score:+.3f})")
+        time.sleep(0.3)
+    progress_done("MTF fetch complete")
 
-    # ── Initial backtest ──────────────────────────────────────────────────────
-    print("\n🔬 Running walk-forward backtest...")
-    bt_data = predictor.run_backtest(historical)
+    print(f"\n   Running walk-forward backtest (capped to 5,000 candles) [MEM-1]...")
+    bt_data = predictor.run_backtest(list(predictor.window), cap=5_000)
     predictor.print_backtest_console(bt_data)
 
     if bt_data:
         acc = bt_data["overall_accuracy"]
         acc_bar = "█" * int(acc / 5) + "░" * (20 - int(acc / 5))
         send_message(ADMIN_CHAT_ID,
-            f"📋 <b>Startup Backtest — v3</b>\n"
+            f"📋 <b>Startup Backtest — v3.1</b>\n"
+            f"<i>(Last 5,000 candles — memory safe)</i>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"  Acted   : {bt_data['total']:,}  |  Skipped: {bt_data['skipped']:,}\n"
             f"  ✅ Correct: {bt_data['correct']:,}\n"
@@ -1738,13 +1771,14 @@ def main():
             f"  <i>Send /backtest for full regime breakdown</i>"
         )
 
-    # ── Start threads ─────────────────────────────────────────────────────────
+    # ── Start background threads ───────────────────────────────────────────────
     threading.Thread(target=polling_thread, daemon=True).start()
     threading.Thread(target=mtf_refresh_loop, args=(predictor,), daemon=True).start()
     if FLASK_AVAILABLE:
         start_dashboard()
 
     # ── First prediction ──────────────────────────────────────────────────────
+    print(f"\n🔮 Generating first prediction...")
     prediction, confidence, signals, is_flat, regime = predictor.predict_next()
     predictor.last_prediction = prediction
     predictor.regime = regime
@@ -1755,7 +1789,7 @@ def main():
         "total": predictor.predictions_made, "skipped": predictor.predictions_skipped,
         "green": predictor.total_green, "red": predictor.total_red,
         "green_pct": predictor.green_pct, "red_pct": predictor.red_pct,
-        "price": float(historical[-1][4]) if historical else 0,
+        "price": float(last_candle[4]) if last_candle else 0,
         "regime": predictor.regime, "signals": signals,
         "ml_confidence": predictor.ml_confidence,
         "min_conf_adaptive": predictor.min_conf_adaptive,
@@ -1767,7 +1801,7 @@ def main():
 
     regime_emoji = {"trending": "📈", "choppy": "〰️", "ranging": "↔️"}.get(regime, "❓")
     send_message(ADMIN_CHAT_ID,
-        f"🚀 <b>BTC Predictor v3 LIVE!</b>\n\n"
+        f"🚀 <b>BTC Predictor v3.1 LIVE!</b>\n\n"
         f"📦 {predictor.candle_count:,} candles | 🟢{predictor.green_pct}% 🔴{predictor.red_pct}%\n"
         f"{regime_emoji} Regime: {regime.upper()}\n"
         f"🤖 ML: {'Trained ✅' if predictor.ml_trained else 'Not available ⚠️'}\n"
@@ -1786,8 +1820,11 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     # LIVE LOOP
     # ══════════════════════════════════════════════════════════════════════════
-    print("\n🔄 Entering live loop...\n")
-    last_seen_time = int(historical[-1][0]) if historical else 0
+    print(f"\n{'='*72}")
+    print("  🔄 LIVE LOOP STARTED — monitoring every 5m candle close")
+    print(f"{'='*72}\n")
+
+    last_seen_time = int(last_candle[0]) if last_candle else 0
     regime_recheck_counter = 0
 
     while True:
@@ -1800,7 +1837,6 @@ def main():
                 outcome    = predictor.record_outcome(actual_dir)
                 predictor.add_candle(latest)
 
-                # Regime update every 10 candles
                 regime_recheck_counter += 1
                 if regime_recheck_counter >= 10:
                     ohlcv  = predictor._ohlcv()
