@@ -68,6 +68,7 @@ ML_TRAIN_MIN    = 500
 ML_TRAIN_CAP    = 5_000                # [MEM-2] max samples for ML training
 ML_RETRAIN_FREQ = 500
 LOOKBACK        = 50
+ML_ONLY_MODE    = True                 # user-requested: only ML prediction output
 
 # ── Timeframes for MTF ────────────────────────────────────────────────────────
 MTF_CONFIG = [
@@ -272,6 +273,18 @@ def get_updates(offset=None):
         r = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=35)
         r.raise_for_status()
         return r.json().get("result", [])
+    except requests.exceptions.HTTPError as e:
+        global _last_telegram_conflict_log
+        status = e.response.status_code if e.response is not None else None
+        if status == 409:
+            now = time.time()
+            if now - _last_telegram_conflict_log >= 60:
+                print("  ⚠️  Telegram polling conflict (409): another bot instance is using this token.")
+                _last_telegram_conflict_log = now
+            time.sleep(3)
+            return []
+        print(f"  ⚠️  getUpdates HTTP error: {e}")
+        return []
     except Exception as e:
         print(f"  ⚠️  getUpdates error: {e}")
         return []
@@ -291,6 +304,7 @@ shared_state = {
     "last_update": "—", "version": "3.1",
 }
 _predictor_ref = None
+_last_telegram_conflict_log = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1091,6 +1105,11 @@ class CandlePredictor:
                 f"{'🟢' if ml_pred=='green' else '🔴'} {ml_pred.upper()} "
                 f"P={ml_conf:.1f}%")
 
+        if ML_ONLY_MODE:
+            if ml_pred is None:
+                return None, 0.0, {"ML_RF": "Model not ready"}, False, regime
+            return ml_pred, ml_conf, {"ML_RF": signals.get("ML_RF", "ML prediction")}, False, regime
+
         # ── Momentum ──────────────────────────────────────────────────────────
         recent = list(self.window)[-50:]
         rg = sum(1 for r in recent if r[1] == "green")
@@ -1853,6 +1872,7 @@ def main():
 
     last_seen_time = int(last_candle[0]) if last_candle else 0
     regime_recheck_counter = 0
+    last_forming_log_ts = 0.0
 
     while True:
         try:
