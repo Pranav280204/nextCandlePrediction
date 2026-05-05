@@ -979,28 +979,30 @@ class CandlePredictor:
             X.append(feats); y.append(label)
 
             if (step + 1) % 500 == 0:
-                progress(step + 1, len(sampled),
-                         f"Extracting features {step+1}/{len(sampled)}")
+                progress(step + 1, len(sampled), "Extracting features")
 
-        progress_done(f"Feature extraction done — {len(X)} samples")
+        progress_done("Extracting features")
 
         if len(X) < 100:
             return f"Insufficient training samples: {len(X)}"
 
         try:
             print("  🤖 Fitting RandomForest...")
+            progress(1, 3, "ML training")
             scaler = StandardScaler()
             Xs = scaler.fit_transform(X)
 
             rf = RandomForestClassifier(
                 n_estimators=100, max_depth=8, min_samples_leaf=5,
-                max_features="sqrt", random_state=42, n_jobs=-1,
+                max_features="sqrt", random_state=42, n_jobs=1,
                 class_weight="balanced"
             )
             rf.fit(Xs, y)
+            progress(2, 3, "ML training")
 
             print("  🤖 Running 5-fold cross-validation...")
-            cv_scores = cross_val_score(rf, Xs, y, cv=5, scoring="accuracy")
+            cv_scores = cross_val_score(rf, Xs, y, cv=5, scoring="accuracy", n_jobs=1)
+            progress_done("ML training")
             cv_mean   = round(cv_scores.mean() * 100, 2)
 
             self.ml_model   = rf
