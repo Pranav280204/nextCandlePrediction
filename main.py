@@ -151,6 +151,10 @@ def now_str():
     return datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
 
 def classify(candle):
+    # Internal tuple format: (ts, direction, o, h, l, c, v)
+    if len(candle) >= 7 and str(candle[1]) in ("green", "red", "doji"):
+        return str(candle[1])
+
     o, c = float(candle[1]), float(candle[4])
     if c > o:   return "green"
     elif c < o: return "red"
@@ -914,7 +918,10 @@ class CandlePredictor:
     # ── Ingest ────────────────────────────────────────────────────────────────
     def add_candle(self, candle):
         direction = classify(candle)
-        o, h, l, c, v = (float(candle[i]) for i in range(1, 6))
+        if len(candle) >= 7 and str(candle[1]) in ("green", "red", "doji"):
+            o, h, l, c, v = (float(candle[i]) for i in range(2, 7))
+        else:
+            o, h, l, c, v = (float(candle[i]) for i in range(1, 6))
 
         if self.window:
             prev = self.window[-1][1]
@@ -1315,11 +1322,21 @@ class CandlePredictor:
         print(f"  🔬 Walk-forward backtest: {total:,} candles...")
 
         for i, candle in enumerate(candles):
-            if i == 0: bt.add_candle(candle); continue
+            # Support both raw exchange candles and internal stored tuples
+            # internal tuple format: (ts, direction, o, h, l, c, v)
+            if len(candle) >= 7 and str(candle[1]) in ("green", "red", "doji"):
+                ingest_candle = [candle[0], candle[2], candle[3], candle[4], candle[5], candle[6]]
+                actual = candle[1]
+            else:
+                ingest_candle = candle
+                actual = classify(candle)
+
+            if i == 0:
+                bt.add_candle(ingest_candle)
+                continue
 
             pred, conf, _, is_flat, regime = bt.predict_next()
-            actual = classify(candle)
-            bt.add_candle(candle)
+            bt.add_candle(ingest_candle)
 
             if (i + 1) % 500 == 0:
                 progress(i + 1, total, f"Backtest {i+1}/{total}")
