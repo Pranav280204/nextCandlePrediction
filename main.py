@@ -68,7 +68,7 @@ ML_TRAIN_MIN    = 500
 ML_TRAIN_CAP    = 5_000                # [MEM-2] max samples for ML training
 ML_RETRAIN_FREQ = 500
 LOOKBACK        = 50
-ML_ONLY_MODE    = True                 # user-requested: only ML prediction output
+ML_ONLY_MODE    = False                # blend ML + technical signals
 
 # ── Timeframes for MTF ────────────────────────────────────────────────────────
 MTF_CONFIG = [
@@ -1895,12 +1895,14 @@ def main():
                 gate_triggered = is_flat or (confidence < predictor.min_conf_adaptive) \
                                  or (predictor.loss_streak >= MAX_LOSS_STREAK)
 
-                if gate_triggered:
-                    predictor.predictions_skipped += 1
-                    reason = ("volatile" if is_flat else
-                              f"low-conf {confidence:.1f}%" if confidence < predictor.min_conf_adaptive else
-                              f"loss-streak {predictor.loss_streak}")
-                    print(f"  ⏭  Skipped — {reason}")
+                if gate_triggered or prediction is None:
+                    predictor.predictions_skipped += 1 if gate_triggered else 0
+                    predictor.last_prediction = None  # avoid carrying stale prediction across skipped candles
+                    if gate_triggered:
+                        reason = ("volatile" if is_flat else
+                                  f"low-conf {confidence:.1f}%" if confidence < predictor.min_conf_adaptive else
+                                  f"loss-streak {predictor.loss_streak}")
+                        print(f"  ⏭  Skipped — {reason}")
                 else:
                     predictor.last_prediction = prediction
 
